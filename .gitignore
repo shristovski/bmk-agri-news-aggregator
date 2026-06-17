@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .DS_Store
 streamlit.log
+bmk-agri-news-aggregator.md
+bmk-agri-news-aggregator-*.md
