@@ -1,3 +1,5 @@
+import os
+from typing import Optional
 import streamlit as st
 
 st.set_page_config(
@@ -8,7 +10,15 @@ st.set_page_config(
 )
 
 from src.config import CATEGORIES, COMMODITIES
-from src.geolocation import detect_location, get_all_regions, get_countries_for_region
+from src.geolocation import (
+    detect_location,
+    extract_client_ip,
+    get_all_regions,
+    get_all_continents,
+    get_countries_for_region,
+    log_debug,
+    DEBUG,
+)
 from src.storage.database import Database
 from src.news.fetcher import get_articles, refresh_articles, fetch_and_store_articles
 from src.news.ranking import rank_articles, filter_by_category
@@ -25,15 +35,33 @@ from src.ui.components import (
 )
 
 
+def get_client_ip_from_streamlit() -> Optional[str]:
+    try:
+        headers = dict(st.context.headers)
+        if DEBUG:
+            log_debug(f"Raw headers: {dict(headers)}")
+        return extract_client_ip(headers)
+    except Exception as e:
+        if DEBUG:
+            log_debug(f"Header extraction error: {e}")
+        return None
+
+
 def main():
     apply_custom_css()
 
-    if "user_location" not in st.session_state:
-        with st.spinner("Detecting your location..."):
-            st.session_state.user_location = detect_location()
-
+    # ---- INIT SESSION STATE ----
     if "db" not in st.session_state:
         st.session_state.db = Database()
+
+    if "location_detected" not in st.session_state:
+        with st.spinner("Detecting your location..."):
+            client_ip = get_client_ip_from_streamlit()
+            st.session_state.client_ip = client_ip
+            user_location = detect_location(client_ip)
+            st.session_state.user_location = user_location
+            st.session_state.location_detected = True
+            st.session_state.location_warning = user_location.country == "Global"
 
     if "articles_fetched" not in st.session_state:
         with st.spinner("Fetching latest agriculture news..."):
@@ -43,16 +71,47 @@ def main():
                 st.toast(f"Loaded {count} articles!", icon="🌾")
 
     user_location = st.session_state.user_location
+    location_warning = st.session_state.location_warning
     db = st.session_state.db
 
     regions = get_all_regions()
+    continents = get_all_continents()
     countries = get_countries_for_region(user_location.region if user_location else "Global")
 
-    render_header(user_location)
-
-    selected_region, selected_country, selected_commodity, search_query, refresh = render_filters(
-        regions, countries, COMMODITIES, user_location
+    # ---- CHECK MANUAL OVERRIDES ----
+    has_manual_override = (
+        st.session_state.get("manual_continent", "Global") != "Global"
+        or st.session_state.get("manual_region", "Global") != "Global"
+        or st.session_state.get("manual_country", "Global") != "Global"
     )
+
+    if has_manual_override:
+        manual_continent = st.session_state.get("manual_continent", "Global")
+        manual_region = st.session_state.get("manual_region", "Global")
+        manual_country = st.session_state.get("manual_country", "Global")
+    else:
+        manual_continent = ""
+        manual_region = ""
+        manual_country = ""
+
+    # ---- RENDER HEADER ----
+    render_header(
+        user_location,
+        manual_region=manual_region,
+        manual_country=manual_country,
+        manual_continent=manual_continent,
+        location_warning=location_warning and not has_manual_override,
+    )
+
+    # ---- RENDER FILTERS ----
+    selected_continent, selected_region, selected_country, selected_commodity, search_query, refresh = render_filters(
+        regions, countries, continents, COMMODITIES, user_location,
+    )
+
+    # Store manual overrides in session state
+    st.session_state.manual_continent = selected_continent if selected_continent != user_location.continent else "Global"
+    st.session_state.manual_region = selected_region if selected_region != user_location.region else "Global"
+    st.session_state.manual_country = selected_country if selected_country != user_location.country else "Global"
 
     if refresh:
         with st.spinner("Refreshing news..."):
@@ -61,46 +120,59 @@ def main():
                 st.toast(f"Loaded {count} new articles!", icon="🌾")
             st.rerun()
 
+    # ---- FETCH ARTICLES ----
     articles = get_articles(db)
 
     if search_query:
         articles = [
-            a
-            for a in articles
+            a for a in articles
             if search_query.lower() in a.get("title", "").lower()
             or search_query.lower() in a.get("summary", "").lower()
         ]
 
     ranked_articles = rank_articles(
         articles,
-        user_location=user_location if selected_region == "Global" and selected_country == "Global" else None,
+        user_location=user_location if not has_manual_override else None,
         selected_region=selected_region,
         selected_country=selected_country,
         selected_commodity=selected_commodity,
     )
 
-    # ====== SECTION 1: Top Agriculture News ======
+    # ---- DEBUG OUTPUT ----
+    if DEBUG:
+        with st.expander("🌐 Geolocation Debug", expanded=True):
+            st.code(
+                f"Client IP: {st.session_state.get('client_ip', 'N/A')}\n"
+                f"Detected: {user_location.country} / {user_location.region} / {user_location.continent}\n"
+                f"Auto-detected: {user_location.is_autodetected}\n"
+                f"Manual override: {has_manual_override}\n"
+                f"Warning: {location_warning}\n"
+                f"Headers: {dict(st.context.headers) if hasattr(st, 'context') else 'N/A'}"
+            )
+
+    # ---- SECTION 1: Top Agriculture News ----
     render_section_header("Top Agriculture News")
     render_top_stories(ranked_articles, count=4)
 
-    # ====== SECTION 2: Local & Regional Agriculture News ======
+    # ---- SECTION 2: Local & Regional Agriculture News ----
     render_section_header("Local & Regional Agriculture News")
-    if user_location and user_location.region != "Global":
+    effective_region = manual_region or (user_location.region if user_location else "Global")
+    effective_continent = manual_continent or (user_location.continent if user_location else "Global")
+
+    if effective_region != "Global":
         local_articles = [
-            a
-            for a in ranked_articles
-            if a.get("region") == user_location.region
-            or a.get("continent") == user_location.continent
+            a for a in ranked_articles
+            if a.get("region") == effective_region or a.get("continent") == effective_continent
         ]
         if local_articles:
             render_article_grid(local_articles[:9], cols_count=3)
         else:
-            st.info(f"No region-specific articles found for {user_location.region}. Showing top stories instead.")
+            st.info(f"No region-specific articles found for {effective_region}. Showing top stories instead.")
             render_article_grid(ranked_articles[4:13], cols_count=3)
     else:
         render_article_grid(ranked_articles[4:13], cols_count=3)
 
-    # ====== SECTION 3: Weather Risk for Agriculture ======
+    # ---- SECTION 3: Weather Risk for Agriculture ----
     render_section_header("Weather Risk for Agriculture")
     weather_col1, weather_col2 = st.columns([1, 2])
     with weather_col1:
@@ -116,7 +188,7 @@ def main():
         else:
             st.info("No weather-related articles available at this time.")
 
-    # ====== SECTION 4: Commodity Market News ======
+    # ---- SECTION 4: Commodity Market News ----
     render_section_header("Commodity Market News")
     commodity_articles = filter_by_category(ranked_articles, "Commodities")
     if not commodity_articles:
@@ -124,16 +196,15 @@ def main():
     if commodity_articles:
         render_article_grid(commodity_articles[:9], cols_count=3)
     else:
-        # If no commodity-specific articles, show some ranked articles
         render_article_grid(ranked_articles[:9], cols_count=3)
 
-    # ====== SECTION 5: Market Prices / Finance ======
+    # ---- SECTION 5: Market Prices / Finance ----
     render_section_header("Market Prices / Finance")
     prices = fetch_market_prices()
     is_demo = is_demo_data()
     render_market_prices(prices, is_demo)
 
-    # ====== SECTION 6: Policy, Trade & Export/Import ======
+    # ---- SECTION 6: Policy, Trade & Export/Import ----
     render_section_header("Policy, Trade & Export/Import")
     policy_articles = filter_by_category(ranked_articles, "Policy & Trade")
     export_articles = filter_by_category(ranked_articles, "Export/Import")
@@ -143,7 +214,7 @@ def main():
     else:
         render_article_grid(ranked_articles[:9], cols_count=3)
 
-    # Footer
+    # ---- FOOTER ----
     st.markdown("---")
     st.markdown(
         """
