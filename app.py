@@ -47,6 +47,23 @@ def get_client_ip_from_streamlit() -> Optional[str]:
         return None
 
 
+def detect_user_location():
+    test_ip = None
+    if DEBUG:
+        test_ip = st.session_state.get("debug_test_ip", "")
+
+    if test_ip:
+        client_ip = test_ip
+        log_debug(f"Using test IP override: {test_ip}")
+    else:
+        client_ip = get_client_ip_from_streamlit()
+
+    st.session_state.client_ip = client_ip
+    user_location = detect_location(client_ip)
+    st.session_state.user_location = user_location
+    st.session_state.location_warning = user_location.country == "Global"
+
+
 def main():
     apply_custom_css()
 
@@ -56,12 +73,8 @@ def main():
 
     if "location_detected" not in st.session_state:
         with st.spinner("Detecting your location..."):
-            client_ip = get_client_ip_from_streamlit()
-            st.session_state.client_ip = client_ip
-            user_location = detect_location(client_ip)
-            st.session_state.user_location = user_location
+            detect_user_location()
             st.session_state.location_detected = True
-            st.session_state.location_warning = user_location.country == "Global"
 
     if "articles_fetched" not in st.session_state:
         with st.spinner("Fetching latest agriculture news..."):
@@ -141,6 +154,21 @@ def main():
     # ---- DEBUG OUTPUT ----
     if DEBUG:
         with st.expander("🌐 Geolocation Debug", expanded=True):
+            widget_test_ip = st.text_input(
+                "Test IP (type any IP and press Enter to override, clear to reset)",
+                value=st.session_state.get("debug_test_ip", ""),
+                placeholder="e.g. 8.8.8.8, 1.1.1.1, 77.28.0.1",
+                key="debug_test_ip_widget",
+            )
+
+            widget_test_ip = widget_test_ip.strip()
+            stored_test_ip = st.session_state.get("debug_test_ip", "")
+
+            if widget_test_ip != stored_test_ip:
+                st.session_state.debug_test_ip = widget_test_ip
+                detect_user_location()
+                st.rerun()
+
             st.code(
                 f"Client IP: {st.session_state.get('client_ip', 'N/A')}\n"
                 f"Detected: {user_location.country} / {user_location.region} / {user_location.continent}\n"
